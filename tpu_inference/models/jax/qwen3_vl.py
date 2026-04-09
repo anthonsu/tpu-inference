@@ -1611,7 +1611,7 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
         """
         del second_per_grid_ts, audio_feature_lengths, use_audio_in_video
 
-        if hf_config is None:
+        if not hf_config:
             hf_config = self.config
 
         llm_positions, mrope_position_delta = build_mrope_input_positions(

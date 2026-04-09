@@ -59,6 +59,14 @@ DTYPE_VIEW_MAP = {
     jnp.dtype(jnp.float32): torch.uint32,
 }
 
+def dump_all_tpu_memory(tag=""):
+    import jax
+    mem_strs = []
+    for d in jax.devices():
+        stats = d.memory_stats()
+        used = stats.get('bytes_in_use', 0) / (1024**2)
+        mem_strs.append(f"D{d.id}:{used:.0f}M")
+    logger.info(f"[MEM-ALL] {tag} | {' '.join(mem_strs)}")
 
 @dataclass
 class MetadataMap:
@@ -177,11 +185,14 @@ def model_weights_single_file_generator(
     # although the tensor would eventually be sharded across multiple TPUs,
     # it would lead to OOM on TPU:0 for large models.
     with jax.default_device(jax.devices("cpu")[0]):
-        with safe_open(weights_file, framework=framework) as f:
+        with safe_open(weights_file, framework="numpy") as f:
             for name in f.keys():
                 if filter_regex is not None and not re.match(
                         filter_regex, name):
                     continue
+                # stats = jax.local_devices()[0].memory_stats()
+                # mem_used = stats.get('bytes_in_use', 0) / (1024**2)
+                # logger.info(f"[DEBUG] About to load: {name} | TPU 0 Mem In Use: {mem_used:.2f} MB")
                 weight_tensor = f.get_tensor(name)
                 yield name, weight_tensor
 
@@ -778,21 +789,37 @@ def assign_and_shard_param(jax_param: nnx.Param,
                            jax_weight: jax.Array,
                            param_name: str = "Unknown",
                            mesh: Optional[Mesh] = None) -> None:
-    """Distributes a JAX array across devices according to the `nnx.Param`'s sharding metadata, assigns it to the parameter, and marks it as loaded.
-
-    Args:
-        jax_param: The target nnx.Param to assign the weight to.
-        jax_weight: The JAX array containing the weight data.
-        param_name: The name of the parameter, used for error logging.
-        mesh: The device mesh to shard the parameter on.
-    """
+    """Distributes a JAX array across devices according to the `nnx.Param`'s sharding metadata."""
+    from jax.sharding import NamedSharding, SingleDeviceSharding
+    # print("here reached")
+    # 1. Try standard attribute
     spec = getattr(jax_param, "sharding", None)
+    
+    # 2. Try standard metadata key
     if spec is None:
-        spec = jax_param.get_metadata().get("sharding", ())
+        spec = jax_param.get_metadata().get("sharding", None)
+        
+    # 3. [THE FIX] Check for JaxMoE's specific 'out_sharding' key
+    if spec is None:
+        spec = jax_param.get_metadata().get("out_sharding", None)
+        
+    # 4. Fallback to physical value inspection
+    if spec is None and hasattr(jax_param, "value") and hasattr(jax_param.value, "sharding"):
+        actual_sharding = jax_param.value.sharding
+        if isinstance(actual_sharding, NamedSharding):
+            spec = actual_sharding.spec
+        elif isinstance(actual_sharding, SingleDeviceSharding):
+            spec = ()
+
+    # 5. Ultimate fallback
+    if spec is None:
+        spec = ()
+        
     if isinstance(spec, NamedSharding):
         spec = spec.spec
     elif isinstance(spec, SingleDeviceSharding):
         spec = ()
+        
     param_mesh = getattr(jax_param, "mesh",
                          None) or jax_param.get_metadata().get("mesh") or mesh
     shape = jax_weight.shape
@@ -801,12 +828,12 @@ def assign_and_shard_param(jax_param: nnx.Param,
         jax_param.set_metadata("_is_loaded", True)
         del jax_weight
         jax.clear_caches()
+        dump_all_tpu_memory(f"Post-Shard-Put ({param_name})")
     except Exception as e:
         raise RuntimeError(
             f"Failed to load weight '{param_name}' with shape {shape} into param "
             f"with shape {jax_param.value.shape}: {type(e).__name__}: {e}"
         ) from e
-
 
 def load_nnx_param_from_reshaped_torch(
         jax_param: nnx.Param,
@@ -830,6 +857,11 @@ def load_nnx_param_from_reshaped_torch(
         mesh: Optional device mesh override used when sharding metadata does not
             already carry the target mesh.
     """
+    # ADD THIS DEBUG PRINT:
+    # logger.info(f"\n[LOAD-START] Processing '{param_name}'")
+    # logger.info(f"   -> Target JAX Shape: {jax_param.value.shape}")
+    # logger.info(f"   -> Source Torch Shape: {torch_weight.shape}")
+
     jax_weight = jax_array_from_reshaped_torch(torch_weight,
                                                reshape_dims=reshape_dims,
                                                permute_dims=permute_dims)
@@ -917,6 +949,8 @@ class LoadableWithIterator:
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
+
+        logger.info("here reached")
         if not isinstance(weights, Iterable):
             # Use next parent class in MRO.
             return super().load_weights(weights)

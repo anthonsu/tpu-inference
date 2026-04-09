@@ -47,6 +47,15 @@ init_fn = nnx.initializers.uniform()
 
 logger = init_logger(__name__)
 
+def dump_all_tpu_memory(tag=""):
+    import jax
+    mem_strs = []
+    for d in jax.devices():
+        stats = d.memory_stats()
+        used = stats.get('bytes_in_use', 0) / (1024**2)
+        mem_strs.append(f"D{d.id}:{used:.0f}M")
+    print(f"[MEM-ALL] {tag} | {' '.join(mem_strs)}")
+
 
 class Qwen3VLMoeDecoderLayer(Qwen3MoeDecoderLayer):
     """MoE decoder layer with MRoPE-aware attention and dense MLP fallback.
@@ -358,7 +367,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     ) -> Tuple[jax.Array, int]:
         del second_per_grid_ts, audio_feature_lengths, use_audio_in_video
 
-        if hf_config is None:
+        if not hf_config:
             hf_config = self.config
 
         if video_grid_thw is not None:
@@ -393,23 +402,42 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             param._weights_to_load = [None] * len(weights_to_load)
 
-    def _to_model_dtype(self,
-                        torch_weight,
-                        *,
-                        permute_dims: Optional[tuple[int, ...]] = None):
-        jax_weight = ensure_cpu_jax_array(torch_weight)
+    def _to_model_dtype(self, torch_weight, *, permute_dims: Optional[tuple[int, ...]] = None):
+        import numpy as np
+        import jax
+        import jax.numpy as jnp
+        
+        # 1. Pure NumPy Transpose (Executes synchronously, 0 TPU memory)
+        np_weight = np.asarray(torch_weight)
         if permute_dims is not None:
-            jax_weight = jnp.transpose(jax_weight, permute_dims)
-        model_dtype = self.vllm_config.model_config.dtype
-        if jax_weight.dtype != model_dtype:
-            jax_weight = jax_weight.astype(model_dtype)
+            np_weight = np.transpose(np_weight, permute_dims)
+            
+        # 2. Pin to CPU strictly using JAX device placement
+        cpu_device = jax.devices("cpu")[0]
+        with jax.default_device(cpu_device):
+            jax_weight = jnp.array(np_weight)
+            
+            # 3. Cast to bfloat16 ON THE CPU
+            model_dtype = self.vllm_config.model_config.dtype
+            if jax_weight.dtype != model_dtype:
+                jax_weight = jax_weight.astype(model_dtype)
+                
+            # 4. CRITICAL: Block until ready. 
+            # This forces the Python loop to pause until JAX finishes the CPU cast,
+            # preventing the async queue from filling up and allowing Python to GC.
+            jax_weight.block_until_ready()
+            
         return jax_weight
 
     @staticmethod
     def _split_moe_fused_weight(hf_weight, *, split_count: int, axis: int):
+        import numpy as np
         if hasattr(hf_weight, "chunk"):
             return hf_weight.chunk(split_count, dim=axis)
-        return jnp.split(ensure_cpu_jax_array(hf_weight), split_count, axis=axis)
+        
+        # 100% Pure NumPy to prevent JAX from async-queueing the split on the TPU
+        np_weight = np.asarray(hf_weight)
+        return np.split(np_weight, split_count, axis=axis)
 
     def _skip_non_expert_weight(self, hf_key: str) -> bool:
         layer_match = re.match(r".*layers\.(\d+)\.(.*)", hf_key)
@@ -488,6 +516,22 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         "Unsupported fused down_proj layout for "
                         f"language_model.layers.{layer_idx}.mlp.experts: "
                         f"source {source_shape} vs target {target_shape}")
+            # --- START HEIST DEBUG ---
+            # import sys
+            # print(f"\n[HEIST] Target: Layer {layer_idx} gate_proj")
+            
+            # param = experts.kernel_gating_EDF
+            # print(f"[HEIST] Param Type: {type(param)}")
+            # print(f"[HEIST] Param dir: {dir(param)}")
+            
+            # if hasattr(param, "value"):
+            #     print(f"[HEIST] Value Sharding: {getattr(param.value, 'sharding', 'Missing')}")
+                
+            # print(f"[HEIST] Metadata: {param.get_metadata() if hasattr(param, 'get_metadata') else 'Missing'}")
+            # print(f"[HEIST] Experts dir: {[a for a in dir(experts) if 'shard' in a.lower()]}")
+            
+            # sys.exit(0) # Kill the script immediately so we don't have to wait for a crash
+        # --- END HEIST DEBUG ---
             assign_and_shard_param(
                 experts.kernel_down_proj_EFD,
                 self._to_model_dtype(hf_weight, permute_dims=permute_dims),
@@ -495,6 +539,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     f"language_model.layers.{layer_idx}.mlp.experts.down_proj"),
                 mesh=self.mesh,
             )
+            # experts.kernel_down_proj_EFD.set_metadata(_weights_to_load=[True])
             return
 
         E, D, F = experts.kernel_gating_EDF.value.shape
@@ -512,20 +557,27 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 f"source {fused_shape} vs expected EDF=({E}, {D}, {F})")
         gate_proj, up_proj = self._split_moe_fused_weight(
             hf_weight, split_count=2, axis=chunk_dim)
+        dump_all_tpu_memory(f"Layer {layer_idx} BEFORE gate_proj shard")
+        
         assign_and_shard_param(
             experts.kernel_gating_EDF,
             self._to_model_dtype(gate_proj, permute_dims=permute_dims),
-            param_name=(
-                f"language_model.layers.{layer_idx}.mlp.experts.gate_proj"),
+            param_name=(f"language_model.layers.{layer_idx}.mlp.experts.gate_proj"),
             mesh=self.mesh,
         )
+        # experts.kernel_gating_EDF.set_metadata(_weights_to_load=[True])
+        
+        dump_all_tpu_memory(f"Layer {layer_idx} AFTER gate_proj shard")
+        
         assign_and_shard_param(
             experts.kernel_up_proj_EDF,
             self._to_model_dtype(up_proj, permute_dims=permute_dims),
-            param_name=(
-                f"language_model.layers.{layer_idx}.mlp.experts.up_proj"),
+            param_name=(f"language_model.layers.{layer_idx}.mlp.experts.up_proj"),
             mesh=self.mesh,
         )
+        # experts.kernel_up_proj_EDF.set_metadata(_weights_to_load=[True])
+        
+        dump_all_tpu_memory(f"Layer {layer_idx} AFTER up_proj shard")
 
     def _finalize_loaded_expert_modules(self, loaded_expert_modules) -> None:
         for experts in loaded_expert_modules.values():
@@ -677,6 +729,8 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             )
 
         for hf_key, hf_weight in weights_iterator:
+            device = list(hf_weight.devices())[0] if hasattr(hf_weight, 'devices') else 'numpy/cpu'
+            print(f"[DEBUG] Yielded: {hf_key} | Device: {device} | Shape: {hf_weight.shape}")
             if self._skip_non_expert_weight(hf_key):
                 continue
             if self._load_moe_router_weight(hf_key, hf_weight):

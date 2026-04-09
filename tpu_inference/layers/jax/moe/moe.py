@@ -321,6 +321,15 @@ class JaxMoE(JaxModule):
         }.items():
             weights_to_load = param._weights_to_load
             if all(w is not None for w in weights_to_load):
+                # --- START INJECTED DEBUG ---
+                print(f"\n--- [DEBUG] READY TO CONCATENATE: {self.prefix} {param_name} ---")
+                for i, w in enumerate(weights_to_load):
+                    devices = getattr(w, "devices", lambda: "No devices attr")()
+                    print(f"  [DEBUG] Exp {i}: shape={getattr(w, 'shape', 'none')}, type={type(w)}, devices={devices}")
+                    if i >= 2: # Just print the first 3 experts to avoid flooding the console
+                        print(f"  [DEBUG] ... skipping the rest of the {len(weights_to_load)} experts")
+                        break
+                # --- END INJECTED DEBUG ---
                 with cpu_mesh_context():
                     weights = jnp.concatenate(param._weights_to_load, axis=0)
                 try:
