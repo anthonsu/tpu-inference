@@ -828,7 +828,7 @@ def assign_and_shard_param(jax_param: nnx.Param,
         jax_param.set_metadata("_is_loaded", True)
         del jax_weight
         jax.clear_caches()
-        dump_all_tpu_memory(f"Post-Shard-Put ({param_name})")
+        # dump_all_tpu_memory(f"Post-Shard-Put ({param_name})")
     except Exception as e:
         raise RuntimeError(
             f"Failed to load weight '{param_name}' with shape {shape} into param "

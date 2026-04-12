@@ -502,6 +502,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return
 
         fused_name = fused_match.group(2)
+        loaded_expert_modules[layer_idx] = experts
         if fused_name == "down_proj":
             target_shape = tuple(experts.kernel_down_proj_EFD.value.shape)
             source_shape = tuple(hf_weight.shape)
@@ -557,7 +558,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 f"source {fused_shape} vs expected EDF=({E}, {D}, {F})")
         gate_proj, up_proj = self._split_moe_fused_weight(
             hf_weight, split_count=2, axis=chunk_dim)
-        dump_all_tpu_memory(f"Layer {layer_idx} BEFORE gate_proj shard")
+        # dump_all_tpu_memory(f"Layer {layer_idx} BEFORE gate_proj shard")
         
         assign_and_shard_param(
             experts.kernel_gating_EDF,
@@ -567,7 +568,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         # experts.kernel_gating_EDF.set_metadata(_weights_to_load=[True])
         
-        dump_all_tpu_memory(f"Layer {layer_idx} AFTER gate_proj shard")
+        # dump_all_tpu_memory(f"Layer {layer_idx} AFTER gate_proj shard")
         
         assign_and_shard_param(
             experts.kernel_up_proj_EDF,
@@ -577,20 +578,63 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         # experts.kernel_up_proj_EDF.set_metadata(_weights_to_load=[True])
         
-        dump_all_tpu_memory(f"Layer {layer_idx} AFTER up_proj shard")
+        # dump_all_tpu_memory(f"Layer {layer_idx} AFTER up_proj shard")
+
+    # def _finalize_loaded_expert_modules(self, loaded_expert_modules) -> None:
+    #     for experts in loaded_expert_modules.values():
+    #         quant_method = getattr(experts, "quant_method", None)
+    #         if quant_method is not None:
+    #             processed = quant_method.process_weights_after_loading(experts)
+    #             if processed is not False:
+    #                 self._clear_loaded_expert_buffers(
+    #                     experts, {
+    #                         "kernel_gating_EDF",
+    #                         "kernel_up_proj_EDF",
+    #                         "kernel_down_proj_EFD",
+    #                     })
 
     def _finalize_loaded_expert_modules(self, loaded_expert_modules) -> None:
-        for experts in loaded_expert_modules.values():
+        import jax.numpy as jnp
+        import gc
+        
+        print("\n" + "-"*60)
+        print("[FIX-TEST] Finalizing Experts: Transposing & Fusing (Memory Leak Fixed)")
+        
+        for layer_idx, experts in loaded_expert_modules.items():
             quant_method = getattr(experts, "quant_method", None)
+            
             if quant_method is not None:
+                # 1. Transpose the weights and trick the gatekeeper
+                for param_name in ["kernel_gating_EDF", "kernel_up_proj_EDF", "kernel_down_proj_EFD"]:
+                    param = getattr(experts, param_name, None)
+                    if param is not None and hasattr(param, "value"):
+                        # Swap dimension 1 and 2, and block to prevent async buffer buildup
+                        param.value = jnp.swapaxes(param.value, 1, 2).block_until_ready()
+                        
+                        wtl = getattr(param, "_weights_to_load", None)
+                        if wtl is not None:
+                            param.set_metadata(_weights_to_load=[True] * len(wtl))
+                            
+                # 2. Process weights (this deletes old attributes and creates new ones)
                 processed = quant_method.process_weights_after_loading(experts)
+                
+                # 3. Synchronize and trigger Garbage Collection
                 if processed is not False:
-                    self._clear_loaded_expert_buffers(
-                        experts, {
-                            "kernel_gating_EDF",
-                            "kernel_up_proj_EDF",
-                            "kernel_down_proj_EFD",
-                        })
+                    # Sync the newly created fused arrays
+                    if hasattr(experts, "kernel_gating_upproj_EDF"):
+                        experts.kernel_gating_upproj_EDF.value.block_until_ready()
+                    if hasattr(experts, "kernel_down_proj_EFD"):
+                        experts.kernel_down_proj_EFD.value.block_until_ready()
+                        
+                    # Sweep the detached old un-fused arrays immediately
+                    gc.collect()
+                    
+                    if layer_idx % 4 == 0 or layer_idx == 47:
+                        print(f"[FIX-TEST] Layer {layer_idx}/47 successfully processed.")
+                        dump_all_tpu_memory()
+                        
+        print("[FIX-TEST] All layers finalized successfully!")
+        print("-" * 60 + "\n")
 
     def _load_moe_expert_weights(self) -> None:
         """Load fused or per-expert HF MoE tensors using real param metadata."""
@@ -729,8 +773,8 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             )
 
         for hf_key, hf_weight in weights_iterator:
-            device = list(hf_weight.devices())[0] if hasattr(hf_weight, 'devices') else 'numpy/cpu'
-            print(f"[DEBUG] Yielded: {hf_key} | Device: {device} | Shape: {hf_weight.shape}")
+            # device = list(hf_weight.devices())[0] if hasattr(hf_weight, 'devices') else 'numpy/cpu'
+            # print(f"[DEBUG] Yielded: {hf_key} | Device: {device} | Shape: {hf_weight.shape}")
             if self._skip_non_expert_weight(hf_key):
                 continue
             if self._load_moe_router_weight(hf_key, hf_weight):
@@ -752,6 +796,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 pp_missing_layers=pp_missing_layers,
             )
 
-        self._finalize_loaded_expert_modules(loaded_expert_modules)
+        # 1. Check and update the non-MoE weights FIRST
         check_all_loaded(params)
         nnx.update(self, params)
+        
+        # 2. Destroy the snapshot so it drops the references 
+        # to the old un-fused MoE tensors.
+        del params
+        
+        # 3. Now execute the MoE fusions. As the old tensors are detached,
+        # Python's Garbage Collector will immediately clear them from TPU memory!
+        self._finalize_loaded_expert_modules(loaded_expert_modules)
