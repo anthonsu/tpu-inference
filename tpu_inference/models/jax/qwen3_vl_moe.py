@@ -356,6 +356,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def get_mrope_input_positions(
         self,
         input_tokens: List[int],
+        mm_features: Optional[list] = None,
         hf_config=None,
         image_grid_thw=None,
         video_grid_thw=None,
@@ -367,7 +368,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     ) -> Tuple[jax.Array, int]:
         del second_per_grid_ts, audio_feature_lengths, use_audio_in_video
 
-        if not hf_config:
+        if getattr(self, "config", None) and not hf_config:
             hf_config = self.config
 
         if video_grid_thw is not None:
