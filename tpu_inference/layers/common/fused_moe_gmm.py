@@ -22,9 +22,41 @@ from jax.sharding import PartitionSpec as P
 
 import tpu_inference.envs as envs
 from tpu_inference.kernels.gather import gather_reduce as gather_reduce_sc
+from tpu_inference.kernels.gather.ragged_gather import ragged_gather
 from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
+from tpu_inference.layers.common.quantization import quantize_tensor
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.logger import init_logger
 from tpu_inference.utils import get_mesh_shape_product
+
+logger = init_logger(__name__)
+
+
+def all_gather_topk_indices_and_weights(
+        topk_indices: jax.Array, topk_weights: jax.Array, dtype: jnp.dtype,
+        mesh: Mesh) -> tuple[jax.Array, jax.Array]:
+    # `topk_indices` and `topk_weights` are relatively small (and last dimension is top-k),
+    # directly all-gather them is inefficient. We use reshape, bitcast to convert the data into one array,
+    #  all gather, then unpack.
+    top_k = topk_indices.shape[-1]
+    topk_indices = topk_indices.astype(jnp.int32).reshape(-1)
+    topk_weights = topk_weights.astype(jnp.float32).reshape(-1)
+    topk_weights = jax.lax.bitcast_convert_type(topk_weights,
+                                                topk_indices.dtype)
+
+    blob = jnp.stack([topk_indices, topk_weights])
+    # The optimization barrier here is to prevent the compiler from reordering the all-gather the operations above.
+    blob = jax.lax.optimization_barrier(blob)
+    gathered_blob = jax.lax.with_sharding_constraint(
+        blob, NamedSharding(mesh, P(None, ShardingAxisName.MLP_DATA)))
+
+    topk_indices = gathered_blob[0]
+    topk_weights = gathered_blob[1]
+    topk_indices = topk_indices.reshape(-1, top_k)
+    topk_weights = jax.lax.bitcast_convert_type(topk_weights, jnp.float32)
+    topk_weights = topk_weights.reshape(-1, top_k).astype(dtype)
+
+    return topk_indices, topk_weights
 
 
 def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
@@ -279,6 +311,7 @@ def expert_parallel_gmm(
     num_experts_per_shard = num_experts // ep_size
     group_offset = jnp.arange(0, num_experts, num_experts_per_shard)
 
+    x_p_spec = P(ShardingAxisName.EXPERT_DATA)
     w1_scale_spec = None if w1_scale is None else ep_p_spec
     w1_bias_spec = None if w1_bias is None else ep_p_spec
     w2_scale_spec = None if w2_scale is None else ep_p_spec
@@ -295,7 +328,7 @@ def expert_parallel_gmm(
         ),
         mesh=mesh,
         in_specs=(
-            data_p_spec,
+            x_p_spec,
             ep_p_spec,
             w1_scale_spec,
             w1_bias_spec,
@@ -324,6 +357,28 @@ def expert_parallel_gmm(
     )
 
 
+def _apply_all_gather_fp8(hidden_states: jax.Array, mesh: Mesh,
+                          dtype: jnp.dtype) -> jax.Array:
+    hidden_states_q, scale = quantize_tensor(
+        jnp.float8_e4m3fn,
+        hidden_states,
+        axis=-1,
+    )
+    # quantize_tensor squeezes the scale if axis is int. We need to expand it back.
+    scale = jnp.expand_dims(scale, -1)
+
+    # Dequantize if needed
+    return jax.shard_map(
+        lambda x, s: (x.astype(jnp.float32) * s).astype(dtype),
+        mesh=mesh,
+        in_specs=(
+            P(ShardingAxisName.MLP_DATA, None),
+            P(ShardingAxisName.MLP_DATA, None),
+        ),
+        out_specs=P(ShardingAxisName.MLP_DATA, None),
+    )(hidden_states_q, scale)
+
+
 @jax.jit(static_argnames=(
     "topk",
     "renormalize",
@@ -333,6 +388,7 @@ def expert_parallel_gmm(
     "scoring_fn",
     "sc_kernel_threshold",
     "sc_kernel_col_chunk_size",
+    "all_gather_fp8",
 ))
 def fused_moe_func(
     hidden_states: jax.Array,
@@ -351,6 +407,7 @@ def fused_moe_func(
     scoring_fn: str,
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
+    all_gather_fp8: bool = False,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
 
@@ -385,20 +442,25 @@ def fused_moe_func(
 
     topk_weights = apply_scoring_fn(scoring_fn, gating_output)
     if envs.FORCE_MOE_RANDOM_ROUTING:
+        logger.warning(
+            "Forcing random routing should be used for performance testing purpose only."
+        )
         # Forcing random routing is useful to get rid of the effect
         # of routing imbalance during performance debugging.
-        rng_key = jax.random.PRNGKey(0)
+        rng_key = jax.random.PRNGKey(42)
         topk_indices = jax.vmap(lambda key: jax.random.choice(
             key, global_num_experts, shape=(topk, ), replace=False))(
                 jax.random.split(rng_key, num_tokens))
-        topk_weights = topk_weights[jnp.arange(num_tokens)[:, None],
-                                    topk_indices]
+        topk_weights = jax.random.uniform(rng_key, shape=(num_tokens, topk))
     else:
         topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    # All gathering topk_indices and topk_weights if attention dp is used.
+    if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
+        topk_indices, topk_weights = all_gather_topk_indices_and_weights(
+            topk_indices, topk_weights, dtype, mesh)
     topk_weights = topk_weights.astype(dtype)
-    # All-gather topk weights for attention dp
     topk_weights = jax.lax.with_sharding_constraint(
         topk_weights, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
 
@@ -409,7 +471,6 @@ def fused_moe_func(
         token_indices = jnp.arange(num_tokens_local,
                                    dtype=jnp.int32).repeat(topk)
         token_indices_sorted = token_indices[topk_argsort_indices]
-        x = hidden_states_local[token_indices_sorted]
         # Below one_hot is equivalent to jnp.bincount(topk_indices_flat,
         # length=global_num_experts) but is more performant.
         group_sizes_local = jax.nn.one_hot(topk_indices_flat,
@@ -417,7 +478,33 @@ def fused_moe_func(
                                            dtype=jnp.int32).sum(axis=0)
         topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)
 
+        if use_ep:
+            num_ep_shard = get_mesh_shape_product(mesh,
+                                                  ShardingAxisName.EXPERT)
+            local_num_experts = global_num_experts // num_ep_shard
+            shard_idx = jax.lax.axis_index(ShardingAxisName.EXPERT)
+
+            experts_start = shard_idx * local_num_experts
+            experts_end = experts_start + local_num_experts
+            group_offsets = jnp.cumulative_sum(group_sizes_local,
+                                               include_initial=True)
+            shard_output_start = group_offsets[experts_start]
+            shard_output_end = group_offsets[experts_end]
+            x = ragged_gather(
+                hidden_states_local,
+                token_indices_sorted,
+                shard_output_start,
+                shard_output_end,
+            )
+        else:
+            x = hidden_states_local[token_indices_sorted]
+
         return x, group_sizes_local, topk_argsort_revert_indices
+
+    x_out_spec = (P(ShardingAxisName.EXPERT_DATA)
+                  if use_ep else P(ShardingAxisName.MLP_DATA))
+    if all_gather_fp8:
+        hidden_states = _apply_all_gather_fp8(hidden_states, mesh, dtype)
 
     x, group_sizes, topk_argsort_revert_indices = jax.shard_map(
         _process_tokens_locally,
@@ -427,13 +514,19 @@ def fused_moe_func(
             P(ShardingAxisName.MLP_DATA, None),
         ),
         out_specs=(
-            P(ShardingAxisName.MLP_DATA, None),
+            x_out_spec,
             P(ShardingAxisName.MLP_DATA),
             P(ShardingAxisName.MLP_DATA),
         ),
+        check_vma=False,
     )(hidden_states, topk_indices)
 
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    try:
+        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    except Exception as e:
+        raise ValueError(
+            f"Error when padding input hidden states from {hidden_size} to {padded_hidden_size}."
+        ) from e
 
     if use_ep:
         x = expert_parallel_gmm(
