@@ -1583,6 +1583,7 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
     def get_mrope_input_positions(
         self,
         input_tokens: List[int],
+        mm_features: Optional[list] = None,
         hf_config=None,
         image_grid_thw=None,
         video_grid_thw=None,
@@ -1611,8 +1612,10 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
         """
         del second_per_grid_ts, audio_feature_lengths, use_audio_in_video
 
-        if not hf_config:
+        if getattr(self, "config", None) and not hf_config:
             hf_config = self.config
+        
+        print("hf_config : " ,hf_config)
 
         llm_positions, mrope_position_delta = build_mrope_input_positions(
             input_tokens=input_tokens,
